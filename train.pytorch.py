@@ -90,7 +90,7 @@ y_train_onehot_padded = np.stack(y_train_onehot)
 new_batch_size = 10000
 y_train_onehot_padded_subset = y_train_onehot_padded[:new_batch_size]
 
-epoch_amount = 100
+epoch_amount = 10000
 
 for epoch in range(epoch_amount):
     outputs = model(x_train_tensor.float())
@@ -109,51 +109,7 @@ for epoch in range(epoch_amount):
 
     outputs = outputs.argmax(1)
 
-    # Get 20 of the audio files to test and check the accuracy
-    test_files = audio_files[:40]
-
-    x_test = []
-    y_test = []
-
-    for file in test_files:
-        if not file.endswith(".mp3"):
-            continue
-
-        file_path = os.path.join(audio_dir, file)
-
-        y, sr = librosa.load(file_path, sr=None, mono=True)
-
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        mfcc = np.transpose(mfcc, (1, 0))
-
-        x_test.append(torch.tensor(mfcc))
-
-        matched_text = df.loc[df['Video Matching'] == file, 'Text'].values[0]
-
-        y_test.append(matched_text)
-
-    y_test_ids = [[char_to_id[char] for char in label] for label in y_test]
-    y_test_padded_ids = pad_sequences(y_test_ids, maxlen=max_len, padding='post', value=char_to_id['<PAD>'])
-    y_test_padded_ids = y_test_padded_ids.reshape(-1, 1)
-
-    y_test_onehot = onehot_encoder.transform(y_test_padded_ids).toarray()
-    y_test_onehot_padded = pad_sequences(y_test_onehot, maxlen=max_len, padding='post')
-
-    x_test_padded = pad_sequences(x_test, maxlen=max_len, padding='post')
-
-    x_test_tensor = torch.tensor(x_test_padded).to(device)
-    y_test_tensor = torch.tensor(y_test_onehot_padded).to(device)
-
-    with torch.no_grad():
-        outputs = model(x_test_tensor.float())
-        outputs = outputs.float()
-
-        y_test_tensor = y_test_tensor.view(-1).long()
-
-        if outputs.shape[0] != y_test_tensor.shape[0]:
-            y_test_tensor = y_test_tensor[:outputs.shape[0]]
-
-        accuracy = (outputs.argmax(1) == y_test_tensor).sum().item() / y_test_tensor.shape[0]
-        print(f"Epoch: {epoch + 1}/{epoch_amount}, Loss: {loss.item()}, Accuracy: {accuracy}")
+    if epoch % 10 == 0:
+        print(f"Epoch: {epoch}, Loss: {loss.item()}, Accuracy: {torch.sum(outputs == y_train_tensor).item() / len(y_train_tensor)}")
 
 torch.save(model.state_dict(), "model.pth")

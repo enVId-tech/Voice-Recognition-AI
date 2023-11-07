@@ -5,7 +5,6 @@ import torch
 import pandas as pd
 from torch import nn
 from keras.preprocessing.sequence import pad_sequences
-from sklearn.metrics import accuracy_score
 from torch.nn.utils.rnn import pad_sequence
 
 # Define your Model class (similar to the one used during training)
@@ -31,6 +30,8 @@ characters = [' ', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', '
 
 # Define the test data directory
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+print("Device: ", device)
 
 model = Model(13, 64, len(characters), num_layers=2).to(device)
 
