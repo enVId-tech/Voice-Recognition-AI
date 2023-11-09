@@ -38,6 +38,8 @@ for file in audio_files:
 
     y_train.append(matched_text)
 
+    print(f"Processed {file}")
+
 characters = list(set(char for label in y_train for char in label))
 characters.append('<PAD>')
 
