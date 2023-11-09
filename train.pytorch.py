@@ -1,117 +1,147 @@
 import os
-import librosa
-import pandas as pd
-import numpy as np
 import torch
-from torch import nn
-from keras.preprocessing.sequence import pad_sequences
-from sklearn.preprocessing import OneHotEncoder
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import torchaudio
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.checkpoint import checkpoint
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print("Device: ", device)
-print(torch.cuda.get_device_name(0))
+# Set CUDA_LAUNCH_BLOCKING before importing torch
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  
 
-audio_dir = "./AUDIO"
-csv_file = "./TEXT/AUDIO.csv"
+# Set the environment variable to limit the maximum split size of the CachingAllocator
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
-audio_files = os.listdir(audio_dir)
+# Define a vocabulary for character-level tokenization
+vocab = {'<pad>': 0, '<start>': 1, '<end>': 2}
+for char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ":
+    vocab[char] = len(vocab)
 
-x_train = []
-y_train = []
+# Hyperparameters
+num_classes = len(vocab)  # Vocabulary size
+batch_size = 2  # Reduced from 16 to 2
+learning_rate = 3e-4
+num_epochs = 100
+max_seq_length = 300
 
-df = pd.read_csv(csv_file)
-
-for file in audio_files:
-    if not file.endswith(".mp3"):
-        continue
-
-    file_path = os.path.join(audio_dir, file)
-
-    y, sr = librosa.load(file_path, sr=None, mono=True)
-
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    mfcc = np.transpose(mfcc, (1, 0))
-
-    x_train.append(torch.tensor(mfcc))
-
-    matched_text = df.loc[df['Video Matching'] == file, 'Text'].values[0]
-
-    y_train.append(matched_text)
-
-    print(f"Processed {file}")
-
-characters = list(set(char for label in y_train for char in label))
-characters.append('<PAD>')
-
-char_to_id = {char: id for id, char in enumerate(characters)}
-id_to_char = {id: char for char, id in char_to_id.items()}
-
-y_train_ids = [[char_to_id[char] for char in label] for label in y_train]
-max_len = max(max(len(mfcc) for mfcc in x_train), max(len(label) for label in y_train_ids))
-
-y_train_padded_ids = pad_sequences(y_train_ids, maxlen=max_len, padding='post', value=char_to_id['<PAD>'])
-y_train_padded_ids = y_train_padded_ids.reshape(-1, 1)
-
-onehot_encoder = OneHotEncoder()
-onehot_encoder.fit(np.array(list(id_to_char.keys())).reshape(-1, 1))
-
-y_train_onehot = onehot_encoder.transform(y_train_padded_ids).toarray()
-y_train_onehot_padded = pad_sequences(y_train_onehot, maxlen=max_len, padding='post')
-
-x_train_padded = pad_sequences(x_train, maxlen=max_len, padding='post')
-
-class Model(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers):
-        super(Model, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+class SpeechToTextModel(nn.Module):
+    def __init__(self, num_classes):
+        super(SpeechToTextModel, self).__init__()
+        self.conv1 = nn.Conv2d(2, 32, kernel_size=(3, 3), padding=(1, 1))
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=(3, 3), padding=(1, 1))
+        self.relu2 = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2), padding=(1, 1))  # Adjust padding
+        self.fc1 = None  # Will be defined later
+        self.fc2 = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        out = self.fc(out)
-        return out
+        x = self.relu1(self.conv1(x))
+        x = self.maxpool(x)
+        x = self.relu2(self.conv2(x))
+        x = self.maxpool(x)
+        x = x.view(x.size(0), -1)
+        
+        # Define self.fc1 here, after we know the shape of x
+        if self.fc1 is None:
+            self.fc1 = nn.Linear(x.size(1), 128).to(x.device)  # Move to the same device as x
+        
+        x = self.fc1(x)
+        x = self.fc2(x)
+        return x
+    
+class CustomSTTDataset(Dataset):
+    def __init__(self, csv_path, audio_dir, max_seq_length):
+        self.data = pd.read_csv(csv_path)
+        self.audio_dir = audio_dir
+        self.max_seq_length = max_seq_length
+
+    def __getitem__(self, idx):
+        audio_path = os.path.join(self.audio_dir, self.data.iloc[idx]['Video Matching'])
+        waveform, sample_rate = torchaudio.load(audio_path)
+        waveform = waveform.mean(dim=0, keepdim=True)  # Convert to mono
+        transcription = self.data.iloc[idx]['Text']
+
+        # Tokenize the transcription to integers
+        tokens = [vocab.get(char, vocab['<pad>']) for char in transcription]
+
+        # Pad the sequence to the maximum length
+        if waveform.size(1) < self.max_seq_length:
+            padding = torch.zeros((waveform.size(0), self.max_seq_length - waveform.size(1)))
+            waveform = torch.cat((waveform, padding), dim=1)
+
+        return waveform, tokens
+
+    def __len__(self):
+        return len(self.data)
+    
+# Create the model and move it to the GPU (if available)
+model = SpeechToTextModel(num_classes)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+if torch.cuda.is_available():
+    print(torch.cuda.get_device_name(0))
+
+# Loss function and optimizer
+criterion = nn.CTCLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Create the dataset with a specified maximum sequence length
+dataset = CustomSTTDataset(csv_path="TEXT/AUDIO.csv", audio_dir="AUDIO", max_seq_length=max_seq_length)
+
+def collate_fn(batch):
+    # Find the maximum length of any waveform in this batch
+    max_length = max(waveform.size(1) for waveform, _ in batch)
+
+    # Pad all waveforms and targets to the same length
+    waveforms = []
+    targets = []
+
+    for waveform, tokens in batch:
+        waveform = waveform.mean(dim=0, keepdim=True)  # Convert to mono
+        input_length = waveform.size(1)
+        target_length = len(tokens)
+
+        # Pad inputs to the maximum length (max_length)
+        if input_length < max_length:
+            padding = torch.zeros((waveform.size(0), max_length - input_length), device=waveform.device)
+            waveform = torch.cat((waveform, padding), dim=1)
+
+        # Pad targets to the maximum length (max_length)
+        if target_length < max_length:
+            tokens += [vocab['<pad>']] * (max_length - target_length)
+
+        waveforms.append(waveform)
+        targets.append(tokens)  # Use append to keep the list of targets as a list of sequences
+
+    return torch.stack(waveforms), targets
+
+# Use DataLoader with the modified dataset and the new collate_fn
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+
+for epoch in range(num_epochs):
+    model.train()
+    for batch_idx, (inputs, targets) in enumerate(dataloader):
+        inputs = inputs.to(device)
+
+        # Convert targets to tensor and flatten
+        targets_flat = torch.tensor([t for tokens in targets for t in tokens]).to(device)
+
+        # Calculate input_lengths and target_lengths for the CTCLoss
+        input_lengths = torch.tensor([waveform.size(2) for waveform in inputs]).to(device)
+        target_lengths = torch.LongTensor([len(targets[i]) for i in range(len(targets))]).to(device)
+
+        print(f"input_lengths: {input_lengths}")
+        print(f"target_lengths: {target_lengths}")
 
 
-model = Model(13, 64, len(characters), num_layers=2).to(device)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters())
-if os.path.exists("model.pth"):
-    model.load_state_dict(torch.load("model.pth"))
+        # Pass the padded sequences through your model
+        outputs = model(inputs.to(device))
 
-x_train_tensor = torch.tensor(x_train_padded).to(device)
-y_train_tensor = torch.tensor(y_train_onehot_padded).to(device)
+        optimizer.zero_grad()
+        loss = criterion(outputs, targets_flat, input_lengths, target_lengths)
+        loss.backward()
+        optimizer.step()
 
-encoder = OneHotEncoder()
-encoder.fit(y_train_padded_ids)
-
-y_train_onehot = [encoder.transform(label.reshape(-1, 1)).toarray() for label in y_train_padded_ids]
-y_train_onehot_padded = np.stack(y_train_onehot)
-new_batch_size = 10000
-y_train_onehot_padded_subset = y_train_onehot_padded[:new_batch_size]
-
-epoch_amount = 10000
-
-for epoch in range(epoch_amount):
-    outputs = model(x_train_tensor.float())
-    outputs = outputs.float()
-
-    y_train_tensor = y_train_tensor.view(-1).long()
-
-    if outputs.shape[0] != y_train_tensor.shape[0]:
-        y_train_tensor = y_train_tensor[:outputs.shape[0]]
-
-    loss = criterion(outputs, y_train_tensor)
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    outputs = outputs.argmax(1)
-
-    if epoch % 10 == 0:
-        print(f"Epoch: {epoch}, Loss: {loss.item()}, Accuracy: {torch.sum(outputs == y_train_tensor).item() / len(y_train_tensor)}")
-
-torch.save(model.state_dict(), "model.pth")
+        print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
